@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install lint dependencies
+        run: |
+          pip install uv
+          uv pip install --system ".[lint]"
+
+      - name: Run ruff linter
+        run: ruff check src/ tests/
+
+      - name: Check ruff formatting
+        run: ruff format --check src/ tests/
+
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system ".[lint]"
+
+      - name: Run mypy
+        run: mypy src/faultscope
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system ".[dev]"
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit -m unit -v \
+            --cov=src/faultscope \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-report=term-missing
+        env:
+          FAULTSCOPE_INFERENCE_API_KEY: test-key
+          FAULTSCOPE_INFERENCE_DB_PASSWORD: testpass
+          FAULTSCOPE_DB_PASSWORD: testpass
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          files: reports/coverage.xml
+          fail_ci_if_error: false
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      kafka:
+        image: confluentinc/cp-kafka:7.6.0
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: localhost:2181
+          KAFKA_ADVERTISED_LISTENERS: >-
+            PLAINTEXT://localhost:9092
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_DB: faultscope_test
+          POSTGRES_USER: faultscope
+          POSTGRES_PASSWORD: testpass
+        options: >-
+          --health-cmd="pg_isready -U faultscope -d faultscope_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system ".[dev]"
+
+      - name: Run integration tests
+        run: pytest tests/integration -m integration -v
+        env:
+          FAULTSCOPE_KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+          FAULTSCOPE_KAFKA_CONSUMER_GROUP: faultscope-main
+          FAULTSCOPE_DB_HOST: localhost
+          FAULTSCOPE_DB_NAME: faultscope_test
+          FAULTSCOPE_DB_USER: faultscope
+          FAULTSCOPE_DB_PASSWORD: testpass
+          FAULTSCOPE_INFERENCE_API_KEY: test-key
+          FAULTSCOPE_INFERENCE_DB_PASSWORD: testpass
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install security tools
+        run: pip install bandit safety
+
+      - name: Run bandit (SAST)
+        run: bandit -r src/ -ll -x tests/
+
+      - name: Check for known vulnerabilities
+        run: safety check --full-report
+        continue-on-error: true
