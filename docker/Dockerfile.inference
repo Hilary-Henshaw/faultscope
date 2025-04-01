@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile.inference
+#
+# Multi-stage image for the FaultScope inference service.
+# Serves RUL predictions and health labels via a FastAPI REST API and also
+# consumes computed feature vectors from Kafka for online inference.
+#
+# Exposes:
+#   8000/tcp  – FastAPI application (predictions, models, sensors endpoints)
+#
+# Build with (from repo root):
+#   docker build -f docker/Dockerfile.inference -t faultscope-inference .
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM faultscope-base AS deps
+
+# TensorFlow/Keras is large; install in a dedicated layer so that changes to
+# application code do not invalidate the heavy ML dependency cache.
+RUN uv pip install --system --no-cache \
+        "tensorflow>=2.15.0" \
+        "keras>=2.15.0"
+
+RUN uv pip install --system --no-cache \
+        "aiokafka>=0.10.0" \
+        "sqlalchemy[asyncio]>=2.0.0" \
+        "asyncpg>=0.29.0" \
+        "alembic>=1.13.0" \
+        "pydantic>=2.6.0" \
+        "pydantic-settings>=2.2.0" \
+        "fastapi>=0.110.0" \
+        "uvicorn[standard]>=0.27.0" \
+        "slowapi>=0.1.9" \
+        "python-jose[cryptography]>=3.3.0" \
+        "numpy>=1.26.0" \
+        "pandas>=2.2.0" \
+        "scikit-learn>=1.4.0" \
+        "scipy>=1.12.0" \
+        "mlflow>=2.10.0" \
+        "boto3>=1.34.0" \
+        "structlog>=24.1.0" \
+        "opentelemetry-sdk>=1.22.0" \
+        "opentelemetry-instrumentation-fastapi>=0.43b0" \
+        "opentelemetry-instrumentation-sqlalchemy>=0.43b0" \
+        "prometheus-client>=0.19.0" \
+        "tenacity>=8.2.0" \
+        "httpx>=0.27.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM deps AS runtime
+
+COPY src/ src/
+
+EXPOSE 8000
+
+HEALTHCHECK \
+    --interval=30s \
+    --timeout=10s \
+    --start-period=60s \
+    --retries=5 \
+    CMD curl --silent --fail http://localhost:8000/health || exit 1
+
+USER faultscope
+
+ENTRYPOINT ["python", "-m", "faultscope.inference"]
