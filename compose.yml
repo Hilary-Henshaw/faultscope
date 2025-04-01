@@ -1,0 +1,322 @@
+name: faultscope
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared configuration anchors
+# ─────────────────────────────────────────────────────────────────────────────
+x-common-env: &common-env
+  FAULTSCOPE_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  FAULTSCOPE_DB_HOST: timescaledb
+  FAULTSCOPE_DB_PORT: 5432
+  FAULTSCOPE_DB_NAME: faultscope
+  FAULTSCOPE_DB_USER: faultscope
+  FAULTSCOPE_DB_PASSWORD: ${FAULTSCOPE_DB_PASSWORD:-faultscope_dev}
+  FAULTSCOPE_REDIS_URL: redis://redis:6379/0
+  FAULTSCOPE_MINIO_ENDPOINT: minio:9000
+  FAULTSCOPE_MINIO_ACCESS_KEY: ${FAULTSCOPE_MINIO_ACCESS_KEY:-minioadmin}
+  FAULTSCOPE_MINIO_SECRET_KEY: ${FAULTSCOPE_MINIO_SECRET_KEY:-minioadmin}
+  FAULTSCOPE_MLFLOW_TRACKING_URI: http://mlflow:5000
+  FAULTSCOPE_LOG_LEVEL: ${FAULTSCOPE_LOG_LEVEL:-INFO}
+  FAULTSCOPE_LOG_FORMAT: json
+
+x-app-restart: &app-restart
+  restart: unless-stopped
+
+x-healthcheck-defaults: &hc-defaults
+  interval: 30s
+  timeout: 10s
+  retries: 5
+  start_period: 30s
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    <<: *app-restart
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    <<: *app-restart
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >-
+        PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: >-
+        PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_COMPRESSION_TYPE: lz4
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      <<: *hc-defaults
+      test:
+        - CMD
+        - kafka-topics
+        - --bootstrap-server
+        - localhost:29092
+        - --list
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./infra/kafka/create-topics.sh:/create-topics.sh:ro
+    entrypoint: ["/bin/bash", "/create-topics.sh"]
+    environment:
+      KAFKA_BROKER: kafka:29092
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    <<: *app-restart
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: faultscope
+      POSTGRES_USER: faultscope
+      POSTGRES_PASSWORD: ${FAULTSCOPE_DB_PASSWORD:-faultscope_dev}
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./infra/timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "pg_isready -U faultscope -d faultscope"]
+
+  redis:
+    image: redis:7.2-alpine
+    <<: *app-restart
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "redis-cli", "ping"]
+
+  minio:
+    image: minio/minio:latest
+    <<: *app-restart
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${FAULTSCOPE_MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${FAULTSCOPE_MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "mc", "ready", "local"]
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.11.0
+    <<: *app-restart
+    ports:
+      - "5000:5000"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${FAULTSCOPE_MINIO_ACCESS_KEY:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${FAULTSCOPE_MINIO_SECRET_KEY:-minioadmin}
+    command: >-
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri sqlite:///mlflow.db
+        --default-artifact-root s3://faultscope-models
+    volumes:
+      - mlflow-data:/mlflow
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+
+  # ── Application Services ───────────────────────────────────────────────────
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ingestion
+    <<: *app-restart
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *common-env
+      FAULTSCOPE_INGEST_MACHINES: "8"
+      FAULTSCOPE_INGEST_INTERVAL_S: "1"
+    profiles:
+      - demo
+
+  streaming:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.streaming
+    <<: *app-restart
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+    ports:
+      - "8002:8002"
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+
+  inference:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.inference
+    <<: *app-restart
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      FAULTSCOPE_INFERENCE_API_KEY: ${FAULTSCOPE_INFERENCE_API_KEY:-dev-key}
+      FAULTSCOPE_INFERENCE_PORT: "8000"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+
+  alerting:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.alerting
+    <<: *app-restart
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      inference:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      FAULTSCOPE_EMAIL_SMTP_HOST: ${FAULTSCOPE_EMAIL_SMTP_HOST:-}
+      FAULTSCOPE_SLACK_WEBHOOK_URL: ${FAULTSCOPE_SLACK_WEBHOOK_URL:-}
+    ports:
+      - "8001:8001"
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    <<: *app-restart
+    depends_on:
+      inference:
+        condition: service_healthy
+      alerting:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      FAULTSCOPE_INFERENCE_BASE_URL: http://inference:8000
+      FAULTSCOPE_ALERTING_BASE_URL: http://alerting:8001
+    ports:
+      - "8501:8501"
+    healthcheck:
+      <<: *hc-defaults
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:8501/_stcore/health
+
+  # ── Observability ──────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    <<: *app-restart
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+
+  grafana:
+    image: grafana/grafana:10.3.3
+    <<: *app-restart
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./src/faultscope/dashboard/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./src/faultscope/dashboard/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+
+  kafdrop:
+    image: obsidiandynamics/kafdrop:3.31.0
+    <<: *app-restart
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9010:9000"
+    environment:
+      KAFKA_BROKERCONNECT: kafka:29092
+      JVM_OPTS: -Xms32m -Xmx64m
+    profiles:
+      - debug
+
+# ─────────────────────────────────────────────────────────────────────────────
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  timescaledb-data:
+  redis-data:
+  minio-data:
+  mlflow-data:
+  prometheus-data:
+  grafana-data:
