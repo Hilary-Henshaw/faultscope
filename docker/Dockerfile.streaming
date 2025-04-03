@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile.streaming
+#
+# Multi-stage image for the FaultScope streaming feature-engineering service.
+# Consumes raw sensor readings from Kafka, computes feature vectors, and
+# publishes them back to Kafka while persisting them in TimescaleDB.
+#
+# Exposes:
+#   8002/tcp  – Prometheus metrics + /health HTTP endpoint
+#
+# Build with (from repo root):
+#   docker build -f docker/Dockerfile.streaming -t faultscope-streaming .
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM faultscope-base AS deps
+
+RUN uv pip install --system --no-cache \
+        "aiokafka>=0.10.0" \
+        "sqlalchemy[asyncio]>=2.0.0" \
+        "asyncpg>=0.29.0" \
+        "pydantic>=2.6.0" \
+        "pydantic-settings>=2.2.0" \
+        "numpy>=1.26.0" \
+        "pandas>=2.2.0" \
+        "scipy>=1.12.0" \
+        "structlog>=24.1.0" \
+        "opentelemetry-sdk>=1.22.0" \
+        "prometheus-client>=0.19.0" \
+        "tenacity>=8.2.0" \
+        "fastapi>=0.110.0" \
+        "uvicorn[standard]>=0.27.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM deps AS runtime
+
+COPY src/ src/
+
+EXPOSE 8002
+
+# Lightweight health check: the streaming service exposes a minimal HTTP server
+# on port 8002 that responds to GET /health.
+HEALTHCHECK \
+    --interval=30s \
+    --timeout=10s \
+    --start-period=30s \
+    --retries=5 \
+    CMD curl --silent --fail http://localhost:8002/health || exit 1
+
+USER faultscope
+
+ENTRYPOINT ["python", "-m", "faultscope.streaming"]

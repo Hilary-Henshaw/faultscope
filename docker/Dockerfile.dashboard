@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile.dashboard
+#
+# Multi-stage image for the FaultScope Streamlit dashboard.
+# Provides a browser-accessible UI for equipment health monitoring,
+# incident management, and model performance review.
+#
+# Exposes:
+#   8501/tcp  – Streamlit HTTP server
+#
+# Build with (from repo root):
+#   docker build -f docker/Dockerfile.dashboard -t faultscope-dashboard .
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM faultscope-base AS deps
+
+RUN uv pip install --system --no-cache \
+        "pydantic>=2.6.0" \
+        "pydantic-settings>=2.2.0" \
+        "streamlit>=1.32.0" \
+        "plotly>=5.19.0" \
+        "pandas>=2.2.0" \
+        "numpy>=1.26.0" \
+        "httpx>=0.27.0" \
+        "structlog>=24.1.0" \
+        "tenacity>=8.2.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM deps AS runtime
+
+COPY src/ src/
+
+# Streamlit configuration via environment so no config.toml is required.
+ENV STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    STREAMLIT_THEME_BASE=dark
+
+EXPOSE 8501
+
+# Streamlit exposes /_stcore/health as its liveness endpoint.
+HEALTHCHECK \
+    --interval=30s \
+    --timeout=10s \
+    --start-period=30s \
+    --retries=5 \
+    CMD curl --silent --fail http://localhost:8501/_stcore/health || exit 1
+
+USER faultscope
+
+ENTRYPOINT ["python", "-m", "faultscope.dashboard"]
