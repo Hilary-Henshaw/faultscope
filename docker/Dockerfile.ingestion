@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile.ingestion
+#
+# Multi-stage image for the FaultScope ingestion service.
+# Publishes synthetic sensor readings to Kafka.
+#
+# Stages:
+#   base  → inherits from faultscope-base
+#   deps  → installs Python dependencies via uv
+#   runtime → copies source tree, drops root, sets entrypoint
+#
+# Build with (from repo root):
+#   docker build -f docker/Dockerfile.ingestion -t faultscope-ingestion .
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM faultscope-base AS deps
+
+# Install all project dependencies (ingestion extras are a subset of the main
+# deps; the package is installed in editable mode so src/ is on PYTHONPATH).
+RUN uv pip install --system --no-cache \
+        "aiokafka>=0.10.0" \
+        "pydantic>=2.6.0" \
+        "pydantic-settings>=2.2.0" \
+        "numpy>=1.26.0" \
+        "pandas>=2.2.0" \
+        "structlog>=24.1.0" \
+        "tenacity>=8.2.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM deps AS runtime
+
+# Copy only the packages needed by the ingestion service.
+COPY src/ src/
+
+# Drop to non-root user before running the process.
+USER faultscope
+
+# The ingestion service is a long-running async process; no HTTP server is
+# exposed, so no port is published and no HEALTHCHECK is needed here.
+# Health is monitored via Kafka consumer-group lag metrics.
+ENTRYPOINT ["python", "-m", "faultscope.ingestion"]
